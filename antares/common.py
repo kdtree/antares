@@ -13,8 +13,7 @@ def wait_for(func, timeout=None, args=[]):
   if not timeout:
     return func(*args)
   def timeout_handler():
-    print("Error: Timeout during Kernel warmup")
-    os._exit(1)
+    raise Exception("Error: Timeout during Kernel warmup")
   from threading import Timer
   my_timer = Timer(timeout, timeout_handler, [])
   my_timer.start()
@@ -78,10 +77,18 @@ def type_to_c(dtype):
   idx = dtype.find('@')
   if idx >= 0:
     return dtype[:idx]
-  native_types = {'float32': 'float', 'int32': 'int', 'int8': 'char'}
+  native_types = {'float32': 'float', 'int32': 'int', 'int8': 'char', 'int64': 'long', 'float64': 'double'}
   if dtype in native_types:
     return native_types[dtype]
   raise Exception("Unhandled ctype mapping case: %s" % dtype)
+
+def get_type_size(dtype):
+  for i in reversed(range(len(dtype))):
+    if not dtype[i].isdigit():
+      bits = int(dtype[i + 1:])
+      assert bits % 8 == 0, "Data type size must align with 8-bit byte size."
+      return bits // 8
+  raise Exception("Unrecognized data size for data type: %s" % dtype)
 
 backend = os.environ['BACKEND'] if 'BACKEND' in os.environ else 'c-rocm'
 AntaresGlobal = Mock()

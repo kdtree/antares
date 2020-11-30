@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 import os
+import re
 import copy
 import json
 import numpy as np
@@ -164,7 +165,7 @@ class OpTensor:
 def parse_to_ast(expr, input_dict={}):
   expr = expr.strip().replace('`', '"')
   if expr.find('[]') >= 0:
-    expr = expr.replace('[]', '[Scaler]')
+    expr = re.sub('\[ *\]', '[Scaler]', expr)
     if expr.rfind('where') == -1:
       expr += ' where Scaler in 1'
     else:
@@ -250,15 +251,6 @@ def parse_to_ast(expr, input_dict={}):
 
   output_name = lval[:lval.index('[')].strip()
   props['output_dict'][output_name] = {"dtype": _root._dtype, "shape": [x["range"] for x in props['data_axes']]}
-  
-  '''
-  print('\nProp:', props)
-  print('\nLval:', lval)
-  print('\nRval:', rval)
-  print('\nAxis:', explicit_range)
-  print('\nRoot:', _root)
-  print()
-  '''
   return {'props': props, 'root': _root}
 
 
@@ -273,7 +265,7 @@ def warp_axis(ax_name):
 
 def emit_tvm_body(node, props):
   if node._op == 'const':
-    return '%s' % node._value
+    return 'tir.const(%s, dtype="%s")' % (node._value, node._dtype)
   elif node._op == 'get_item':
     tensor = node._value['tensor']
     index = node._value['index']
@@ -310,8 +302,6 @@ def emit_tvm_body(node, props):
     else:
       raise Exception('Unrecognized op type: %s[%d]' % (op_name, op_input_size))
   elif node._op == 'cast':
-    if node._value["inputs"][0]._op == 'const':
-      return 'np.%s(%s)' % (node._value['name'], emit_tvm_body(node._value["inputs"][0], props))
     return '%s.astype(cast_dtype("%s"))' % (emit_tvm_body(node._value["inputs"][0], props), node._value['name'])
   elif node._op == 'call':
     return 'tir.call_pure_extern(cast_dtype("%s"), "%s", %s)' % (node._dtype, node._value['name'], ', '.join([emit_tvm_body(x, props) for x in node._value["inputs"]]))
@@ -374,114 +364,50 @@ def apply_fusion(ast, top_ast):
   walk_in_ast(ast['root'], _replace_tensor, [], ast, 'root')
   return ast
 
-def build_fused_ast(statements, input_dict):
-  core_comp = None
-  statements = [x.strip() for x in statements.split(';')]
-  prev_ast, inputs = {}, copy.deepcopy(input_dict)
-  for stat in statements:
-    single_stat = stat.strip()
-    if not single_stat:
+def emit_tvm_ir_v2(exprss, input_dict, extra_outputs):
+  statements = [s_.strip() for s_ in exprss.split(';')]
+  inputs = copy.deepcopy(input_dict)
+  output_dict = {}
+  ast_seq = []
+  for s in statements:
+    if not s:
       continue
-    ast = parse_to_ast(single_stat, input_dict=inputs)
-    if prev_ast:
-      ast = apply_fusion(ast, prev_ast)
-    outputs = ast['props']['output_dict']
-    if ast['props']['reduce_type'] is None:
-      prev_ast[next(iter(outputs))] = ast
-    elif core_comp is None:
-      core_comp = ast
-    else:
-      raise Exception("At most 1 reduce computation is allowed within 1 fused kernel.")
+    ast = parse_to_ast(s, inputs)
+    ast_outputs_dict = ast['props']['output_dict']
+    assert len(ast_outputs_dict) == 1, "Unhandled non-single outputs within single AST expression"
+    for k in ast_outputs_dict:
+      inputs[k] = ast_outputs_dict[k]
+      if k in extra_outputs:
+        output_dict[k] = ast_outputs_dict[k]
+    ast_seq.append(ast)
 
-    for k in outputs:
-      inputs[k] = outputs[k]
-    '''
-    for k in prev_ast:
-      # print(">>", k, hash(str(prev_ast[k])))
-      print("\n>>", k, prev_ast[k])
-    print("=====>", core_comp)
-    '''
+  # Also include the last output
+  if k not in extra_outputs:
+    output_dict[k] = ast_outputs_dict[k]
 
-  # Cleanup input_dict
-  ast['props']['input_dict'] = copy.deepcopy(input_dict)
-
-  if core_comp is None:
-    return ast
-
-  core_name = next(iter(core_comp['props']['output_dict']))
-  ast_name = next(iter(ast['props']['output_dict']))
-
-  core_comp['props']['input_dict'] = copy.deepcopy(input_dict)
-  ast['props']['input_dict'][core_name] = copy.deepcopy(core_comp['props']['output_dict'][core_name])
-
-  # Align naming for injective axis and core axis
-  if core_name != ast_name:
-    replace_maps = {}
-    if core_comp['props']['output_dict'][core_name]['shape'] != ast['props']['output_dict'][ast_name]['shape']:
-      raise Exception("Injective computation doesn't match with core computation in shape.")
-    for i in range(len(ast['props']['data_axes'])):
-      replace_maps[ast['props']['data_axes'][i]['name']] = core_comp['props']['data_axes'][i]['name']
-    ast['props']['data_axes'] = core_comp['props']['data_axes']
-
-    visited = set()
-    def _replace_axis(node, replace_maps, visited):
-      if node._op == 'axis' and id(node._value) not in visited:
-        node._value['name'] = replace_maps[node._value['name']]
-        visited.add(id(node._value))
-      return None
-    walk_in_ast(ast['root'], _replace_axis, [replace_maps, visited], ast, 'root')
-
-    core_comp['injective'] = ast
-    ast = core_comp
-
-  ast['props']['input_dict'] = copy.deepcopy(input_dict)
-  if 'injective' in ast:
-    ast['injective']['props']['input_dict'] = ast['props']['input_dict']
-  return ast
-
-def compute_mem_access(ast):
-
-  def parse_bytes(dtype):
-    for i in reversed(range(len(dtype) - 1)):
-      if not dtype[i].isdigit():
-        return (int(dtype[i + 1:]) + 7) // 8
-    raise Exception('Illegal data type: %s' % dtype)
-
-  mem_access_bytes = 0
-  for k in ast['props']['input_dict']:
-    prop = ast['props']['input_dict'][k]
-    mem_access_bytes += np.product(prop['shape']) * parse_bytes(prop['dtype'])
-  for k in ast['props']['output_dict']:
-    prop = ast['props']['output_dict'][k]
-    mem_access_bytes += np.product(prop['shape']) * parse_bytes(prop['dtype'])
-
-  return mem_access_bytes
- 
-def emit_tvm_ir(exprss, input_dict):
-  ast = build_fused_ast(exprss, input_dict)
+  # Registry Global Argument Properties
   arg_props = {'_in': [], '_out': []}
-  for k in ast['props']['input_dict']:
-    prop = copy.deepcopy(ast['props']['input_dict'][k])
+  for k in input_dict:
+    prop = copy.deepcopy(input_dict[k])
     prop['name'] = k
     arg_props['_in'].append(prop)
-  for k in ast['props']['output_dict']:
-    prop = copy.deepcopy(ast['props']['output_dict'][k])
+  for k in output_dict:
+    prop = copy.deepcopy(output_dict[k])
     prop['name'] = k
     arg_props['_out'].append(prop)
   arg_props['_in'].sort(key=lambda x: x['name'])
   arg_props['_out'].sort(key=lambda x: x['name'])
   os.environ['GLOBAL_ARG_PROPS'] = json.dumps(arg_props)
 
-  from lang import auto_shard
-  auto_shard.compute(ast)
+  import importlib
+  passes = os.listdir('lang/pass')
+  passes.sort()
+  for pas in passes:
+    if pas.endswith('.py'):
+      pass_stage = importlib.import_module('lang.pass.%s' % pas[:-3])
+      pass_stage.run_pass_v2(ast_seq, input_dict, output_dict)
 
-  from lang import simplify
-  simplify.compute(ast)
-
-  os.environ['MEM_ACCESS'] = str(compute_mem_access(ast))
-
-  bias_axis_body = ''
-
+  # Generate LL_IR body for ast_seq
   def emit_input_body(input_dict):
     input_body = ''
     for key in input_dict:
@@ -511,21 +437,22 @@ def emit_tvm_ir(exprss, input_dict):
       reduce_pattern = '%s'
     return reduce_body, reduce_pattern
 
-  def emit_output_body(ast, reduce_pattern, final_output=True, injective=False):
+  def emit_output_body(ast, reduce_pattern):
     root, props = ast['root'], ast['props']
     output_shape = [x['range'] for x in props['data_axes']]
     output_name = next(iter(props['output_dict']))
     all_axis_range = np.product(output_shape) * np.product([x['range'] for x in props['reduce_axes']])
     output_begin = '%s = output(shape=%s, flops=(%d * %d), func=lambda %s: ' % (output_name, output_shape, props['flopbase'], all_axis_range, ', '.join([warp_axis(x['name']) for x in props['data_axes']]))
     basic_body = emit_tvm_body(root, props)
-    output_end = ', dtype="%s", tag="%s", name="%s", final_output=%s); ' % (props['output_dict'][output_name]['dtype'], 'antares_injective' if injective else '', output_name, final_output)
+    output_end = ', dtype="%s", tag="%s", name="%s", final_output=%s); ' % (props['output_dict'][output_name]['dtype'], '', output_name, output_name in output_dict)
     return output_begin + reduce_pattern % basic_body + output_end
 
-  final_body = bias_axis_body + emit_input_body(ast['props']['input_dict'])
+  ll_irs = [emit_input_body(input_dict)]
+  for ast in ast_seq:
+    loops_def, pattern = emit_reduce_body(ast)
+    ll_irs.append(loops_def + emit_output_body(ast, pattern))
+  return '\n'.join(ll_irs)
 
-  has_injective = 'injective' in ast
-  reduce_body, reduce_pattern = emit_reduce_body(ast)
-  final_body += reduce_body + emit_output_body(ast, reduce_pattern, final_output=(not has_injective), injective=False)
-  if has_injective:
-    final_body += emit_output_body(ast['injective'], '%s', final_output=True, injective=True)
-  return final_body
+
+def emit_tvm_ir(exprss, input_dict, extra_outputs):
+  return emit_tvm_ir_v2(exprss, input_dict, extra_outputs)

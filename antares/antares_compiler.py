@@ -12,6 +12,7 @@ import re
 import json
 import importlib
 import signal
+import collections
 
 import tvm
 from tvm import autotvm
@@ -19,9 +20,19 @@ from tvm.autotvm.task.dispatcher import ApplyConfig
 from tvm.autotvm.task import ConfigEntity
 
 from antares.common import *
-from templates.auto.generic import custom_dtypes
+from lang.generic import custom_dtypes, refactor_multiple_names
 
-signal.signal(signal.SIGINT, lambda signum, frame: sys.exit(1))
+AntaresGlobal.cleanup_funcs = []
+
+def cleanup_on_exit(signum, frame):
+  for func in AntaresGlobal.cleanup_funcs:
+    try:
+      func()
+    except:
+      pass
+  sys.exit(1)
+
+signal.signal(signal.SIGINT, cleanup_on_exit)
 
 tvm_target = 'cuda'
 eval_program_timeout = 30
@@ -50,30 +61,35 @@ def get_search_space(config_space):
       raise Exception("Cannot recognize search space type: %s" % (config_space.space_map[name].__class__))
   return search_space
 
-def translate_code(code):
+def get_global_arg_props():
+  global_arg_props = os.environ.get('GLOBAL_ARG_PROPS', '')
+  if not global_arg_props:
+    global_arg_props = AntaresGlobal.local_arg_pros
+  else:
+    global_arg_props = json.loads(global_arg_props)
+  return global_arg_props
+
+def translate_code(code, config):
   assert(len(code.split('extern "C"')) == 2)
+  global_arg_props = get_global_arg_props()
+
   def get_kernel_metadata():
     inp_args, outp_args = [], []
 
-    global_arg_bufs = os.environ.get('GLOBAL_ARG_PROPS', '')
-    if not global_arg_bufs:
-      global_arg_bufs = AntaresGlobal.current_arg_bufs
-    else:
-      global_arg_bufs = json.loads(global_arg_bufs)
-
-    for buf in global_arg_bufs['_in']:
+    for buf in global_arg_props['_in']:
       if buf['name'].startswith('_'):
         # Just for Auto Shard
         assert(buf['dtype'] == 'int32' and buf['shape'] == [1])
         continue
       inp_args.append('-'.join([str(x) for x in buf['shape']]) + '/' + buf['dtype'] + '/' + buf['name'])
-    for buf in global_arg_bufs['_out']:
+    for buf in global_arg_props['_out']:
       outp_args.append('-'.join([str(x) for x in buf['shape']]) + '/' + buf['dtype'] + '/' + buf['name'])
 
     header_meta = '///' + ','.join(inp_args) + ':' + ','.join(outp_args) + '\n// BACKEND = %s\n' % backend
-    properties = "// CONFIG: %s\n// COMPUTE_V1: %s\n" % (os.environ['CONFIG'].strip(), os.environ['COMPUTE_V1'] if os.environ['OP'] == 'auto.generic' else os.environ['OP'])
+    properties = "// CONFIG: %s\n// COMPUTE_V1: %s\n" % (config.strip() if isinstance(config, str) else '', os.environ['COMPUTE_V1'])
     return header_meta + properties
 
+  code = refactor_multiple_names(code, global_arg_props)
   code = platform_config.do_native_translation(code, attrs=AntaresGlobal.attrs)
   try:
     defs = platform_config.get_intrisic_defs() + '\n'
@@ -82,6 +98,9 @@ def translate_code(code):
   return '%s\n%s%s' % (get_kernel_metadata(), defs, code)
 
 def device_properties():
+  if hasattr(AntaresGlobal, 'device_props'):
+    return AntaresGlobal.device_props
+
   props = tvm.runtime.ndarray.gpu(0)
   with open('%s/device_properties.cfg' % os.environ['ANTARES_DRIVER_PATH'], 'r') as fp:
     mem_bandwith = []
@@ -94,22 +113,9 @@ def device_properties():
         mem_bandwith.append(float(val))
     mem_bandwith = 'inf' if not mem_bandwith else np.product(mem_bandwith) * 2.5e-7
     props.mem_bandwith = float(mem_bandwith)
+
+  AntaresGlobal.device_props = props
   return props
-
-def compile_source(code):
-  if 'HTTP_SERVICE' in os.environ:
-    return bytearray()
-  kernel_src = local_get_dir_file("my_kernel.cc")
-  kernel_out = local_get_dir_file("my_kernel.out")
-  with open(kernel_src, 'w') as fp:
-    fp.write(translate_code(code))
-  args = platform_config.get_compile_kernel_args(kernel_src, kernel_out, device_properties())
-
-  if verbose:
-    print('[Build (pid=%d)]' % os.getpid(), ' '.join(args))
-  assert run_process_with_timeout(args, krnl_compile_timeout), "Compilation failed for: Bad kernel code, or Time limit exceeded?\nFailure command: %s\n" % ' '.join(args)
-  with open(kernel_out, "rb") as fp:
-    return bytearray(fp.read())
 
 def compute_gflops(flop, t):
   try:
@@ -117,11 +123,22 @@ def compute_gflops(flop, t):
   except:
     return 0.0
 
-def codehub_db(compute_key, source_code=None):
+def do_compilation(compile_args, verbose=True):
+  if verbose:
+    print('[Build (pid=%d)]' % os.getpid(), ' '.join(compile_args))
+  assert run_process_with_timeout(compile_args, krnl_compile_timeout), "Compilation failed for: Bad kernel code, or Time limit exceeded?\nFailure command: %s\n" % ' '.join(compile_args)
+
+def codehub_db(compute_key, source_code=None, erase=False):
   compute_key = compute_key.split('##')[0].strip()
   digest = hashlib.sha256(compute_key.encode()).hexdigest()
   os.system('mkdir -p ./codehub')
   code_path = './codehub/%s.%s' % (digest, backend)
+  if erase:
+    try:
+      os.remove(code_path)
+    except:
+      pass
+    return None
   if not source_code:
     if os.path.exists(code_path):
       print('  >> Codehub Key = %s.%s' % (digest, backend))
@@ -135,7 +152,44 @@ def codehub_db(compute_key, source_code=None):
       fp.write(source_code)
     return code_path
 
-def get_target_source(s, arg_bufs, dir_sid=None):
+def get_target_source(best_config, dir_sid=None):
+  default_tune_op = AntaresGlobal.default_tune_op
+  if not isinstance(best_config, str):
+    # Default config
+    with ApplyConfig(best_config):
+      with tvm.target.Target(tvm_target):
+        s, arg_bufs = default_tune_op.get_template_op()
+  elif best_config.startswith('['):
+    # Ansor config
+    from tvm import auto_scheduler
+    origin_cfg = json.loads(best_config)
+    origin_cfg = {
+      "i": [['["main_compute.<locals>.auto_template"]', 'cuda -keys=cuda,gpu -max_num_threads=%d -thread_warp_size=%d' % (
+                device_properties().max_threads_per_block, device_properties().warp_size
+             )], origin_cfg],
+      "r": [[0], 0, 0, 0],
+      "v": "v0.2",
+    }
+    origin_cfg_file = local_get_dir_file('my_kernel.cfg')
+    with open(origin_cfg_file, 'w') as fp:
+      fp.write(json.dumps(origin_cfg))
+    origin_cfg = tvm.auto_scheduler.measure_record.load_records(origin_cfg_file)
+ 
+    from tuner.AutoTVM2.main import create_auto_task
+    target = tvm.target.Target(tvm_target)
+    auto_task = create_auto_task(target)
+
+    for inp, res in origin_cfg:
+      s, arg_bufs = auto_task.compute_dag.apply_steps_from_state(inp.state)
+      break
+  else:
+    # Standard config
+    json_to_config = AntaresGlobal.default_task.antares_helper.json_to_config
+    config = json_to_config(json.loads(best_config))
+    with ApplyConfig(config):
+      with tvm.target.Target(tvm_target):
+        s, arg_bufs = default_tune_op.get_template_op()
+
   if s is not None:
       lower_source = str(tvm.lower(s, arg_bufs, simple_mode=True))
 
@@ -180,11 +234,9 @@ def get_target_source(s, arg_bufs, dir_sid=None):
       for allocate_type, allocate_size in allocate_shared:
         if allocate_type.startswith('custom['):
           type_name = allocate_type[7:].split(']')[0]
-          shared_memory_inc = int(custom_dtypes[type_name][-1].split('@')[-1])
         else:
-          shared_memory_inc = 8 * np.dtype(allocate_type).itemsize
-        assert shared_memory_inc % 8 == 0, "The bits of shared_memory is not aligned with 8-bit bytes."
-        shared_memory_in_bytes += shared_memory_inc // 8 * allocate_size
+          type_name = allocate_type
+        shared_memory_in_bytes += get_type_size(type_name) * allocate_size
 
       if shared_memory_in_bytes > max_shared_memory_per_block:
         raise Exception("Invalid kernel code: using shared_memory_in_bytes %d > max_shared_memory_per_block %d" % (shared_memory_in_bytes, max_shared_memory_per_block))
@@ -195,19 +247,19 @@ def get_target_source(s, arg_bufs, dir_sid=None):
       func = build_template()
 
   assert(len(func.imported_modules) == 1)
-  device_source = translate_code(func.imported_modules[0].get_source())
+  device_source = translate_code(func.imported_modules[0].get_source(), best_config)
   kernel_path = local_get_dir_file('my_kernel.cc', dir_sid=dir_sid)
-  return device_source, kernel_path
+  with open(kernel_path, 'w') as fp:
+    fp.write(device_source)
 
-def evaluate_perf(kernel_path, task_flop, dev_id):
-  try:
-    eval_client = importlib.import_module('platforms.%s.evaluator.client' % backend)
-  except ModuleNotFoundError:
-    print('>> Evaluator for backend %s not found, skipping evaluation.' % backend)
-    return None
-  except:
-    traceback.print_exc()
-    return None
+  kernel_out = local_get_dir_file('my_kernel.out', dir_sid=dir_sid)
+  compile_args = platform_config.get_compile_kernel_args(kernel_path, kernel_out, device_properties())
+  return device_source, kernel_path, compile_args
+
+def code_suffix(tpr=-1.0, step_prod=0, step_plan=-1):
+  return '\n// Saved Perf = %.6e sec / run; Step Produced = %d; Planned Steps = %d;' % (tpr, step_prod, step_plan)
+
+def evaluate_perf(kernel_path, dev_id, device_source, dir_sid=None, verbose=True):
 
   def handle_result(result):
     if verbose:
@@ -220,19 +272,31 @@ def evaluate_perf(kernel_path, task_flop, dev_id):
     if t is None:
       print("\n[Antares] Incorrect compute kernel from evaluator.")
     else:
-      gflops = compute_gflops(task_flop, t)
+      gflops = compute_gflops(AntaresGlobal.default_task.flop, t)
       if verbose:
         print("\n[Antares] Average time cost / run = %g sec, %g gflops." % (t, gflops))
       with open(local_get_dir_file('result.txt'), 'w') as fp:
         fp.write(str(t) + '\n')
-        if 'K/0' in result:
-          fp.write(str(result['K/0']) + '\n')
-    if os.environ['OP'] == 'auto.generic' and os.environ.get('COMMIT', ''):
-      kernel_path = codehub_db(os.environ['COMPUTE_V1'], source_code=device_source + '\n// Saved Perf = %g sec / run' % t)
+        for i in range(len(result)):
+          key = 'K/%d' % i
+          if key not in result:
+            break
+          fp.write(str(result[key]) + '\n')
+    if os.environ.get('COMMIT', ''):
+      kernel_path = codehub_db(os.environ['COMPUTE_V1'], source_code=device_source + code_suffix(tpr=t))
       print('  >> Update current code to codehub: %s' % kernel_path)
 
   def do_evaluate():
     try:
+      try:
+        eval_client = importlib.import_module('platforms.%s.evaluator.client' % backend)
+      except ModuleNotFoundError:
+        print('>> Evaluator for backend %s not found, skipping evaluation.' % backend)
+        return None
+      except:
+        traceback.print_exc()
+        return None
+
       expected_timeout = os.environ.get('EXPECTED_TIMEOUT', '')
       if expected_timeout in ('', 'inf'):
         expected_timeout = ''
@@ -240,69 +304,69 @@ def evaluate_perf(kernel_path, task_flop, dev_id):
         expected_timeout = float(expected_timeout)
         expected_timeout = max(expected_timeout * 1.1, expected_timeout + 0.1)
 
-      results = eval_client.eval(kernel_path=local_get_dir_file('my_kernel.cc'),
+      results = eval_client.eval(kernel_path=local_get_dir_file('my_kernel.cc', dir_sid=dir_sid),
                   expected_timeout=expected_timeout,
                   dev_id=dev_id,
                 )
       return results
     except:
-      traceback.print_exc()
+      if verbose:
+        traceback.print_exc()
       return None
 
   exec_fd, _ = system_lock([dev_id])
-  results = wait_for(do_evaluate, eval_program_timeout if int(os.environ.get('STEP', '0')) > 0 else None)
-  if results is not None:
-    handle_result(results)
+  try:
+    results = wait_for(do_evaluate, eval_program_timeout if int(os.environ.get('STEP', '0')) > 0 else None)
+    if results is not None:
+      handle_result(results)
+  except:
+    pass
   exec_fd()
   return results
 
 def compute_mem_ratio(tpr):
-  access_bytes = int(os.environ.get('MEM_ACCESS', '0'))
+  if math.isinf(tpr) or math.isinf(float(device_properties().mem_bandwith)):
+    return -1
+
+  global_arg_props = get_global_arg_props()
+  access_bytes = 0
+  for buf in global_arg_props['_in']:
+    access_bytes += np.product(buf['shape']) * get_type_size(buf['dtype'])
+  for buf in global_arg_props['_out']:
+    access_bytes += np.product(buf['shape']) * get_type_size(buf['dtype'])
+
+  access_bytes = int(access_bytes)
+  if access_bytes <= 0:
+    return -1
   ratio = np.ceil(access_bytes * 1e-7 / tpr / device_properties().mem_bandwith)
   return min(int(ratio), 100)
 
-def run_config_entity(params_given, dir_sid, expected_timecost='inf', tune_dev_id=0):
-  dir_sid = str(dir_sid)
-  result_file = local_get_dir_file('result.txt', dir_sid)
+def run_config_entity(target_source, config_str, dir_sid, expected_timecost='inf', dev_id=0):
+  print("  >> [ ] Param_entity on sid = %s: config = '%s', dev_id = %d, upper_bound_tpr = %.6e s" % (dir_sid, config_str, dev_id, expected_timecost))
   try:
-    os.remove(result_file)
+    assert target_source is not None, "Invalid target source detected in verification stage."
+    device_source, kernel_path, compile_args = target_source
+
+    do_compilation(compile_args, verbose=False)
+    results = evaluate_perf(kernel_path, dev_id, device_source, dir_sid, verbose=False)
+    assert results is not None and 'TPR' in results, "Invalid target output detected in evaluation stage."
+    digest = ','.join(['%.6e' % float(results['K/%d' % i]) for i in range(len(results) - 1)])
+    result = float(results['TPR'])
   except:
-    pass
-  config_str = json.dumps(params_given)
-  envs = {}
-  envs['CONFIG'] = config_str
-  envs['DIR_SID'] = dir_sid
-  envs['DEV_KEY'] = str(tune_dev_id)
-  expected_timecost = float(expected_timecost)
-  if math.isinf(expected_timecost):
-    envs['EXPECTED_TIMEOUT'] = ''
-  else:
-    envs['EXPECTED_TIMEOUT'] = str(expected_timecost)
-  env_str = ' '.join(["%s='%s'" % (x, envs[x]) for x in envs])
-  print("  >> [ ] Param_entity on sid = %s: config = '%s', dev_id = %d, upper_bound_tpr = %.6e s" % (dir_sid, config_str, tune_dev_id, expected_timecost))
-  log_path = local_get_dir_file('evaluator.log', dir_sid)
-  exe_cmd = "%s python%d %s > %s.stdout 2> %s.stderr" % (env_str, sys.version_info.major, ' '.join(sys.argv), log_path, log_path)
-  try:
-    assert 0 == os.system(exe_cmd)
-    with open(result_file, 'r') as fp:
-      parts = fp.read().split()
-      result = float(parts[0].strip())
-      digest = float(parts[1].strip()) if len(parts) > 1 else float('inf')
-  except:
-    result = digest = float('inf')
-  print("  >> [*] Param_entity on sid = %s: config = '%s', tpr = `%.6f`, digest = `%g`, mem_occupy = %d %%" % (dir_sid, config_str, result, digest, compute_mem_ratio(result)))
+    digest = 'null'
+    result = float('inf')
+  print("  >> [*] Param_entity on sid = %s: config = '%s', tpr = `%.6f`, digest = `%s`, mem_occupy = %d %%" % (dir_sid, config_str, result, digest, compute_mem_ratio(result)))
   return result
 
 
 def main_compute(code_only=False):
-  tvm.register_func('tvm_callback_cuda_compile', compile_source, override=True)
+  def compile_callback(code):
+   return bytearray()
+  tvm.register_func('tvm_callback_cuda_compile', compile_callback, override=True)
   logging.getLogger('autotvm').setLevel(logging.DEBUG)
   logging.getLogger('autotvm').addHandler(logging.StreamHandler(sys.stdout))
 
-  default_tune_op = importlib.import_module('templates.' + (os.environ['OP'] if 'OP' in os.environ else 'auto.generic'))
-  if verbose:
-    print('  >> Backend = %s, Python PID = %s, Task = %s;' % (backend, os.getpid(), default_tune_op.__name__))
-
+  default_tune_op = importlib.import_module('lang.generic')
   task = autotvm.task.create("template_op", args=(), target=tvm_target)
 
   def json_to_config(json_dict, index=-1, code_hash=None):
@@ -312,7 +376,6 @@ def main_compute(code_only=False):
         json_list.append([key, 'ot' if type(json_dict[key]) is not list else ('sp' if json_dict[key][0:1] == [-1] else 're'), json_dict[key]])
       json_dict = json_list
     config = ConfigEntity.from_json_dict({"index": index, "time": "", "code_hash": code_hash, "entity": json_dict})
-    # config = ConfigEntity.from_json_dict({"i": index, "t": "", "c": code_hash, "e": json_dict})
     return config
 
   def config_to_json(config):
@@ -321,46 +384,33 @@ def main_compute(code_only=False):
     if isinstance(config, str):
       return json.loads(config)
     jobj = config.to_json_dict()['entity']
-    # jobj = config.to_json_dict()['e']
     json_dict = dict()
     for i in range(len(jobj)):
       assert(jobj[i][1] in ['sp', 'ot', 're'])
       json_dict[jobj[i][0]] = jobj[i][2]
     return json_dict
 
+  task.antares_helper = Mock()
+  task.antares_helper.json_to_config = json_to_config
+  task.antares_helper.config_to_json = config_to_json
+  task.antares_helper.to_json_search_space = get_search_space
+
+  AntaresGlobal.default_tune_op = default_tune_op
+  AntaresGlobal.default_task = task
+
+  if verbose:
+    print('  >> Backend = %s, Python PID = %s, Task = %s;' % (backend, os.getpid(), default_tune_op.__name__))
+
   num_trials = int(os.environ['STEP']) if 'STEP' in os.environ else 0
 
   config = os.environ.get('CONFIG', '').strip()
   if config != '':
     best_config = config
-  elif 'NNI_TRIAL_JOB_ID' in os.environ:
-    if os.environ['NNI_TRIAL_JOB_ID'] == '@':
-      search_space = get_search_space(task.config_space)
-      json_space = json.dumps(search_space)
-      dump_to_file='./search_space.json'
-      print("\n>> Writing Search Space to '%s', Search Space = %s;" % (dump_to_file, json_space))
-      with open("search_space.json", "w") as fp:
-        fp.write(json_space)
-      sys.exit(0)
-
-    try:
-      import nni
-      params_given = nni.get_next_parameter()
-      if params_given is None:
-        raise
-      local_dir_id = os.environ['NNI_TRIAL_JOB_ID']
-    except:
-      params_given = default_tune_op.get_choice_example()
-      local_dir_id = '_'
-    t = run_config_entity(params_given, local_dir_id)
-    gflops = compute_gflops(task.flop, t)
-    print('[Antares-engine] Final entity result is: %g' % gflops)
-    try:
-      nni.report_final_result(gflops)
-    except:
-      print('[Antares-engine] (not reporting final result to NNI.)')
-    exit(0)
-
+  elif os.environ.get('NNI_TRIAL_JOB_ID', '') == '@':
+    search_space = get_search_space(task.config_space)
+    json_space = json.dumps(search_space)
+    print("\n>> Search Space: %s" % (json_space))
+    sys.exit(0)
   elif num_trials > 0:
     dev_num = platform_config.get_execution_parallism()
     if dev_num <= 0:
@@ -376,15 +426,13 @@ def main_compute(code_only=False):
       worker_size = batch_size
     thread_pool = ThreadPoolExecutor(max_workers=worker_size)
 
-    task.antares_helper = Mock()
-    task.antares_helper.json_to_config = json_to_config
-    task.antares_helper.config_to_json = config_to_json
-    task.antares_helper.to_json_search_space = get_search_space
-
     tuner_type = os.environ.get('TUNER', '')
     if not tuner_type:
-      comp = os.environ['COMPUTE_V1']
-      if '=!' in comp and 'plan/' not in comp[comp.find(' ##') + 1:] and ';' not in comp and backend in ['c-rocm', 'c-cuda', 'c-hlsl', 'c-ocl']:
+      explicit_ops = AntaresGlobal.attrs.explicit_ops
+      if ('|plan/' not in ('|' + '|'.join(AntaresGlobal.attrs.options)) and
+          len(explicit_ops) == 1 and
+          len(explicit_ops[-1].reduce_axis) > 0 and
+          backend in ['c-rocm', 'c-cuda', 'c-hlsl', 'c-ocl']):
         tuner_type = 'AutoTVM2'
       else:
         tuner_type = 'XGBoost'
@@ -403,19 +451,36 @@ def main_compute(code_only=False):
     except:
       raise Exception('>> Cannot import Antares Tuner: %s' % tuner_type)
 
+    if hasattr(tuner, 'cleanup'):
+      AntaresGlobal.cleanup_funcs.append(tuner.cleanup)
+
     if tuner is not None:
       AntaresGlobal.current_step = 0
 
       def measure_batch(inputs):
         results, futures = [], []
-        best_slot = -1
+        target_sources, config_strs = [], []
+        for i in range(len(inputs)):
+          dir_sid = AntaresGlobal.current_step + i + 1
+          config_strs.append(json.dumps(config_to_json(inputs[i].config)))
+          try:
+            target_source = get_target_source(config_strs[i], dir_sid)
+          except:
+            # traceback.print_exc()
+            target_source = None
+          target_sources.append(target_source)
+
         expected_timecost = tuner.task.best.timecost
         for i in range(len(inputs)):
-          futures.append(thread_pool.submit(run_config_entity, config_to_json(inputs[i].config), AntaresGlobal.current_step + i + 1, expected_timecost, i % dev_num))
+          dir_sid = AntaresGlobal.current_step + i + 1
+          futures.append(thread_pool.submit(run_config_entity, target_sources[i], config_strs[i], dir_sid, expected_timecost, i % dev_num))
+
+        best_slot = -1
         for i in range(len(inputs)):
+          dir_sid = AntaresGlobal.current_step + i + 1
           t = futures[i].result()
           if t < tuner.task.best.timecost:
-            best_slot = AntaresGlobal.current_step + i + 1
+            best_slot = dir_sid
             tuner.task.best.timecost = t
             tuner.task.best.config = inputs[i].config
             tuner.task.best.occur = best_slot
@@ -435,7 +500,7 @@ def main_compute(code_only=False):
             device_source = fp.read()
           with open(local_get_dir_file('result.txt', best_slot), 'r') as fp:
             t = float(fp.read().split()[0])
-          kernel_path = codehub_db(os.environ['COMPUTE_V1'], source_code=device_source + '\n// Saved Perf = %g sec / run; Step Produced = %d;' % (t, best_slot))
+          kernel_path = codehub_db(os.environ['COMPUTE_V1'], source_code=device_source + code_suffix(tpr=t, step_prod=best_slot, step_plan=num_trials))
           print('  >> Update current code to codehub: %s' % kernel_path)
         return results
 
@@ -475,57 +540,24 @@ def main_compute(code_only=False):
         num_trials,
         tuner.task.best.timecost))
 
-      if hasattr(tuner, 'cleanup'):
-        tuner.cleanup()
+      cleanup_on_exit(0, 0)
     else:
       raise Exception('Unrecognized tuner type: `%s`' % tuner_type)
     exit(0)
   else:
-    if os.environ['OP'] == 'auto.generic':
-      saved_code = codehub_db(os.environ['COMPUTE_V1'])
-      if saved_code is not None:
-        print("  >> Using Saved Code from Codehub:")
-        print("===========================")
-        print(saved_code)
-        print("===========================")
-        exit(0)
+    saved_code = codehub_db(os.environ['COMPUTE_V1'])
+    if saved_code is not None:
+      print("  >> Using Saved Code from Codehub:")
+      print("===========================")
+      print(saved_code)
+      print("===========================")
+      exit(0)
     best_config = ''
 
   assert isinstance(best_config, str)
-  if verbose:
-    print("====>> [Current Config Option]", best_config)
-  if best_config.startswith('['):
-    from tvm import auto_scheduler
-    origin_cfg = json.loads(best_config)
-    origin_cfg = {
-      "i": [['["main_compute.<locals>.auto_template"]', 'cuda -keys=cuda,gpu -max_num_threads=%d -thread_warp_size=%d' % (
-                device_properties().max_threads_per_block, device_properties().warp_size
-             )], origin_cfg],
-      "r": [[0], 0, 0, 0],
-      "v": "v0.2",
-    }
-    origin_cfg_file = local_get_dir_file('my_kernel.cfg')
-    with open(origin_cfg_file, 'w') as fp:
-      fp.write(json.dumps(origin_cfg))
-    origin_cfg = tvm.auto_scheduler.measure_record.load_records(origin_cfg_file)
- 
-    @auto_scheduler.register_workload
-    def auto_template():
-      _, arg_bufs = default_tune_op.get_template_op()
-      return arg_bufs
 
-    target = tvm.target.Target("cuda")
-    auto_task = auto_scheduler.create_task(auto_template, (), target)
-    for inp, res in origin_cfg:
-      s, arg_bufs = auto_task.compute_dag.apply_steps_from_state(inp.state)
-      break
-  else:
-    config = json_to_config(json.loads(best_config)) if best_config else task.config_space
-    with ApplyConfig(config):
-      with tvm.target.Target(tvm_target):
-        s, arg_bufs = default_tune_op.get_template_op()
-
-  device_source, kernel_path = get_target_source(s, arg_bufs)
+  best_config = best_config if best_config else task.config_space
+  device_source, kernel_path, compile_args = get_target_source(best_config)
 
   if code_only:
     return device_source
@@ -535,56 +567,96 @@ def main_compute(code_only=False):
     print(device_source)
     print("====================================\n")
 
+  do_compilation(compile_args)
   dev_id = int(os.environ.get('DEV_KEY', '0'))
-  result = evaluate_perf(kernel_path, task.flop, dev_id)
+  result = evaluate_perf(kernel_path, dev_id, device_source)
   exit(0 if result is not None else 1)
 
 
-if __name__ == '__main__':
+def rest_service():
+  import tornado
+  import tornado.httpserver
+  import tornado.ioloop
+  import tornado.web
 
-  if 'HTTP_SERVICE' in os.environ:
-    import tornado
-    import tornado.httpserver
-    import tornado.ioloop
-    import tornado.web
+  task_lists = collections.deque()
 
-    class IndexHandler(tornado.web.RequestHandler):
+  def clear_environ(compute_exp, step):
+      os.environ['COMPUTE_V1'] = compute_exp
+      os.environ['STEP'] = str(step)
+      os.environ['LL_IR'] = ''
+      os.environ['COMMIT'] = 'force'
+
+  class IndexHandler(tornado.web.RequestHandler):
       @tornado.gen.coroutine
       def get(self):
         compute_exp = self.request.headers.get('COMPUTE_V1', '')
-        print(">> New connection from peer: `%s`" % (compute_exp))
+        num_step = self.request.headers.get('STEP', '')
+        print(">> New connection from peer: `%s` (step = %s)" % (compute_exp, num_step))
 
-        code = codehub_db(compute_exp)
-        if code is None:
-          os.environ['COMPUTE_V1'] = compute_exp
-          os.environ['OP'] = 'auto.generic'
-          os.environ['STEP'] = '0'
-          os.environ['LL_IR'] = ''
-          try:
-            code = main_compute(code_only=True)
-          except:
-            print('>> Kernel code failed to generate.')
-            code = '[ERROR] ' + traceback.format_exc()
+        if num_step == '@':
+          code = '\n'.join(['Steps: %d; Exprs: %s' % (s, c) for s, c in task_lists])
+        elif num_step not in ('', '0'):
+          task = (int(num_step), compute_exp)
+          if task not in task_lists:
+            task_lists.append(task)
+          codehub_db(compute_exp, erase=True)
+          code = '[Async Task Has Been Put in Background ..]'
+        else:
+          code = codehub_db(compute_exp)
+          if code is None:
+            clear_environ(compute_exp, 0)
+            duplicate_items = [(s, c) for s, c in task_lists if c == compute_exp]
+            try:
+              code = main_compute(code_only=True)
+              if duplicate_items:
+                code += code_suffix(tpr=-1.0, step_prod=0, step_plan=duplicate_items[0][0])
+            except:
+              print('>> Kernel code failed to generate.')
+              code = '[ERROR] ' + traceback.format_exc()
         self.write(code)
         self.flush()
         print(">> Finish subprocess.")
         # yield tornado.gen.sleep(2)
 
-    app = tornado.web.Application([
+  app = tornado.web.Application([
         (r"/", IndexHandler),
       ],
       cookie_secret = str(random.random()),
       debug = False,
-    )
-    app.port = int(os.environ.get('HTTP_PORT', '8880'))
+  )
+  app.port = int(os.environ.get('HTTP_PORT', '8880'))
 
-    print("* Antares service for backend = `%s` is listening on ':%d'" % (backend, app.port))
-    tornado.httpserver.HTTPServer(app).listen(app.port)
-    tornado.ioloop.IOLoop.current().start()
-  else:
-    try:
+  print("* Antares service for backend = `%s` is listening on ':%d'" % (backend, app.port))
+  tornado.httpserver.HTTPServer(app).listen(app.port)
+
+  def scan_tasks(ioloop):
+      try:
+        if os.wait3(os.WNOHANG)[0] != 0:
+          task_lists.popleft()
+          raise ChildProcessError
+        ## Still waiting for current task to complete
+      except ChildProcessError:
+        if task_lists:
+          task_step, task_expr = task_lists[0]
+          clear_environ(task_expr, task_step)
+          os.environ['HTTP_SERVICE'], _ = '', os.environ['HTTP_SERVICE']
+          os.spawnlp(os.P_NOWAIT, '/bin/bash', 'bash', '%s/run.sh' % os.path.dirname(os.path.abspath(__file__)))
+          os.environ['HTTP_SERVICE'] = _
+      ioloop.add_timeout(time.time() + 5, lambda: scan_tasks(ioloop))
+
+  ioloop = tornado.ioloop.IOLoop.current()
+  scan_tasks(ioloop)
+  ioloop.start()
+
+
+if __name__ == '__main__':
+  try:
+    if os.environ.get('HTTP_SERVICE', ''):
+      rest_service()
+    else:
       main_compute()
-    except SystemExit:
-      sys.exit(0)
-    except:
-      traceback.print_exc()
+  except SystemExit:
+    sys.exit(0)
+  except:
+    traceback.print_exc()
